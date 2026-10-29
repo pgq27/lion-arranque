@@ -43,12 +43,23 @@ frase), el bloque de `~/.ssh/config`, el clon en
 1. Confirmar que ya creaste en Hestia el dominio, la base y el SSL.
 2. Pegar la llave **pública** que imprime en GitHub → `pgq27/Lion` → Settings →
    Deploy keys → Add deploy key, **sin** marcar *Allow write access*, y pulsar Enter.
-3. Si `private/` ya tenía una instalación, confirmar que la mueve a `private.anterior`.
+3. Si el dominio ya tenía algo (una instalación de Lion o de otro sistema), el
+   arranque instala **de cero**: antes de borrar `private/` te pide **escribir el
+   dominio**; si el `.env` anterior indica una base, te pregunta si la vacía
+   (`php artisan db:wipe`) y te dice su nombre y usuario para que los anotes (el
+   instalador te los vuelve a pedir, con la clave). No guarda copias: lo borrado
+   no vuelve. Si en `public_html` hay archivos de otro sistema, también pide
+   confirmar antes de borrarla; si es un enlace a otro lado, solo quita el enlace.
+   Después `instalar.sh` la enlaza a `private/public`, para que `.env`, `storage` y
+   `.git` queden fuera de lo que el servidor publica. Si no confirmas, no se borra
+   nada y se sigue con lo que haya.
 
 ## Qué no hace
 
 - No guarda ningún secreto: la llave privada nace y se queda en el servidor.
   El token del actualizador se carga después, en el panel de Lion.
+- No toca el cron ni nada fuera de `private/` y `public_html/` de ese dominio (el
+  crontab del usuario puede tener líneas de otros sistemas).
 - No toca Hestia: el dominio, la base y el SSL se crean en el panel.
 - No repite la lógica de `instalar.sh` (PHP, `.env`, migraciones, cron, worker,
   verificación): eso lo hace el instalador del repositorio privado.

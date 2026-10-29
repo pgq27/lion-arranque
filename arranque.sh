@@ -26,6 +26,9 @@
 # Código de salida: el de instalar.sh; 2 si termina bien pero quedan pendientes de
 # la preparación; 1 si se cortó por un error.
 
+# Las funciones del usuario del sitio viajan dentro de un bash nuevo (declare -f): shellcheck no
+# ve esa llamada y las da por no usadas.
+# shellcheck disable=SC2329
 set -euo pipefail
 
 REPO_PRIVADO='git@github.com:pgq27/Lion.git'
@@ -91,7 +94,6 @@ preguntar() {
     fi
 }
 
-# shellcheck disable=SC2329
 esperar_enter() {
     if hay_terminal; then
         printf '  %s ' "$1" >/dev/tty
@@ -385,9 +387,8 @@ preparar_servidor() {
 # El código que corre el usuario del sitio: todas las funciones de este script más la llamada,
 # en un bash NUEVO con -e activo (dentro de un `|| …` bash apagaría -e en la función).
 codigo_del_usuario() {
-    printf 'set -euo pipefail; %s
-%s
-parte_del_usuario %s'         "$(declare -p REPO_PRIVADO URL_GITHUB_LLAVES LLAVE)" "$(declare -f)" "$(printf '%q ' "$@")"
+    printf 'set -euo pipefail; %s\n%s\nparte_del_usuario %s' \
+        "$(declare -p REPO_PRIVADO URL_GITHUB_LLAVES LLAVE)" "$(declare -f)" "$(printf '%q ' "$@")"
 }
 
 # Entra como el usuario del sitio. SOLO se llama desde la rama con root o sudo; el resto
@@ -402,14 +403,79 @@ correr_como_el_usuario_del_sitio() {
     fi
 }
 
+# El PHP de consola de la versión del sitio (la del pool de PHP-FPM del dominio); si no hay, `php`.
+php_del_sitio() {
+    local pool version
+    for pool in /etc/php/*/fpm/pool.d/"$1".conf; do
+        if [[ -e "$pool" ]]; then
+            version="${pool#/etc/php/}"
+            version="${version%%/*}"
+            if command -v "php$version" >/dev/null 2>&1; then
+                printf 'php%s' "$version"
+                return 0
+            fi
+        fi
+    done
+    printf 'php'
+}
+
+# Un valor del .env de la instalación que hay, sin comillas (solo para nombres, nunca claves).
+valor_del_env() {
+    local linea
+    linea="$(grep -E "^$2=" "$1/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+    linea="${linea%\"}"
+    printf '%s' "${linea#\"}"
+}
+
+# Borra lo que haya en private/ para instalar de cero. No hay copia ni vuelta atrás, por eso se
+# pide escribir el dominio. Devuelve 0 si limpió y 1 si el dueño no lo confirmó.
+limpiar_private() {
+    local dominio="$1" private="$2" respuesta='' base usuario_base php_bin vaciar=0
+    if [[ -z "$dominio" || -L "$private" || ! -d "$private" || "$private" != /home/*/web/"$dominio"/private ]]; then
+        morir "No borro $private: no es la carpeta private/ de un sitio de Hestia."
+    fi
+    aviso "$private ya tiene contenido (¿una instalación de Lion o de otro sistema?):"
+    find "$private" -mindepth 1 -maxdepth 1 -printf '%f\n' | head -n 8 | sed 's/^/      /' || true
+    if ! hay_terminal; then
+        return 1
+    fi
+    printf '\n  Para instalar de cero se BORRA todo lo que hay en %s\n' "$private" >/dev/tty
+    printf '  (código, .env y storage con los archivos subidos). No se guarda copia.\n' >/dev/tty
+    printf '  Escribe %s para borrar y empezar de cero, o pulsa Enter para dejarlo como está: ' "$dominio" >/dev/tty
+    read -r respuesta </dev/tty || respuesta=''
+    if [[ "$respuesta" != "$dominio" ]]; then
+        return 1
+    fi
+    base="$(valor_del_env "$private" DB_DATABASE)"
+    usuario_base="$(valor_del_env "$private" DB_USERNAME)"
+    if [[ -n "$base" && -f "$private/artisan" && -f "$private/vendor/autoload.php" ]]; then
+        aviso "La instalación actual usa la base «$base» (usuario «$usuario_base»): anota esos datos, el instalador te los va a pedir junto con la clave."
+        if preguntar "¿Vacío también la base «$base» (borra TODAS sus tablas) para que la instalación sea de cero?"; then
+            vaciar=1
+        fi
+    fi
+    if [[ $vaciar -eq 1 ]]; then
+        php_bin="$(php_del_sitio "$dominio")"
+        haciendo "vaciando la base «$base» con $php_bin artisan db:wipe"
+        if ! (cd "$private" && "$php_bin" artisan db:wipe --force); then
+            morir "No pude vaciar la base «$base»: no borré nada de $private. Vacíala a mano (Hestia → Base de datos) y vuelve a correr el arranque."
+        fi
+        hecho "base «$base» vacía"
+    fi
+    haciendo "borrando el contenido de $private"
+    if ! find "$private" -mindepth 1 -delete; then
+        morir "No pude borrar todo el contenido de $private. Revisa los permisos y vuelve a correr el arranque."
+    fi
+    hecho "$private quedó vacía"
+}
+
 # Todo lo que sigue corre con la identidad del usuario del sitio. No se llama por nombre acá:
 # `codigo_del_usuario` lo manda dentro del bash nuevo.
-# shellcheck disable=SC2329
 # Argumentos: DOMINIO USUARIO [opciones de instalar.sh…]
 parte_del_usuario() {
     local dominio="$1" usuario="$2"
     shift 2
-    local casa private publica config limite=() intento clon_ok anterior codigo
+    local casa private publica config llave_publica limite=() intento clon_ok hay_que_clonar destino codigo
 
     casa="$HOME"
     private="$casa/web/$dominio/private"
@@ -423,24 +489,6 @@ parte_del_usuario() {
     done
     mkdir -p "$casa/.ssh"
     chmod 700 "$casa/.ssh"
-    if [[ -f "$casa/$LLAVE" ]]; then
-        ya_estaba "$casa/$LLAVE (ed25519, sin frase)"
-    else
-        haciendo "generando $casa/$LLAVE (ed25519, sin frase, solo vive en este servidor)"
-        ssh-keygen -q -t ed25519 -C "lion@$dominio" -f "$casa/$LLAVE" -N ''
-        hecho "llave creada: la privada se queda acá; solo se comparte la pública"
-    fi
-    publica="$(cat "$casa/$LLAVE.pub")"
-
-    config="$casa/.ssh/config"
-    if [[ -f "$config" ]] && grep -q 'lion_deploy' "$config"; then
-        ya_estaba "$config ya apunta a la llave de despliegue"
-    else
-        printf 'Host github.com\n  IdentityFile ~/%s\n  StrictHostKeyChecking accept-new\n' "$LLAVE" >>"$config"
-        chmod 600 "$config"
-        hecho "$config: github.com usa la llave de despliegue"
-    fi
-
     if command -v timeout >/dev/null 2>&1; then
         limite=(timeout 30)
     fi
@@ -449,50 +497,72 @@ parte_del_usuario() {
             ${limite[@]+"${limite[@]}"} git ls-remote --heads "$REPO_PRIVADO" main >/dev/null 2>&1 </dev/null
     }
 
-    intento=0
-    until el_remoto_responde; do
-        intento=$((intento + 1))
-        printf '\n  Pega esta llave pública en GitHub → pgq27/Lion → Settings → Deploy keys → Add deploy key\n'
-        printf '  (SIN marcar «Allow write access»: el servidor solo lee). Enlace: %s\n\n' "$URL_GITHUB_LLAVES"
-        printf '  ┌──────────────────────────────────────────────────────────────────────\n'
-        printf '  │ %s\n' "$publica"
-        printf '  └──────────────────────────────────────────────────────────────────────\n\n'
-        if ! hay_terminal; then
-            falta "la llave de despliegue: GitHub todavía no la acepta. Pégala como se indica arriba y vuelve a correr el mismo comando (la llave ya existe, no se rehace)."
-            printf '\n'
-            return 2
+    # Si este usuario YA llega al repositorio privado (una llave de despliegue de antes, por
+    # ejemplo), no se crea otra: una llave de despliegue solo puede estar en un repositorio.
+    if el_remoto_responde; then
+        ya_estaba 'GitHub ya responde por SSH con la configuración de este usuario (no genero otra llave)'
+    else
+        if [[ -f "$casa/$LLAVE" ]]; then
+            ya_estaba "$casa/$LLAVE (ed25519, sin frase)"
+        else
+            haciendo "generando $casa/$LLAVE (ed25519, sin frase, solo vive en este servidor)"
+            ssh-keygen -q -t ed25519 -C "lion@$dominio" -f "$casa/$LLAVE" -N ''
+            hecho "llave creada: la privada se queda acá; solo se comparte la pública"
         fi
-        esperar_enter 'Cuando la hayas guardado en GitHub, pulsa Enter…'
-        if el_remoto_responde; then
-            break
+        llave_publica="$(cat "$casa/$LLAVE.pub")"
+
+        config="$casa/.ssh/config"
+        if [[ -f "$config" ]] && grep -q 'lion_deploy' "$config"; then
+            ya_estaba "$config ya apunta a la llave de despliegue"
+        else
+            printf 'Host github.com\n  IdentityFile ~/%s\n  StrictHostKeyChecking accept-new\n' "$LLAVE" >>"$config"
+            chmod 600 "$config"
+            hecho "$config: github.com usa la llave de despliegue"
         fi
-        if ((intento >= 3)) || ! preguntar 'GitHub aún no responde con esa llave. ¿Reintento?' s; then
-            falta 'la llave de despliegue: git ls-remote no responde por SSH. Revisa que la pegaste entera en Deploy keys de pgq27/Lion y vuelve a correr el mismo comando.'
-            return 2
-        fi
-    done
-    hecho "GitHub responde por SSH con la llave de despliegue"
+
+        intento=0
+        until el_remoto_responde; do
+            intento=$((intento + 1))
+            printf '\n  Pega esta llave pública en GitHub → pgq27/Lion → Settings → Deploy keys → Add deploy key\n'
+            printf '  (SIN marcar «Allow write access»: el servidor solo lee). Enlace: %s\n\n' "$URL_GITHUB_LLAVES"
+            printf '  ┌──────────────────────────────────────────────────────────────────────\n'
+            printf '  │ %s\n' "$llave_publica"
+            printf '  └──────────────────────────────────────────────────────────────────────\n\n'
+            if ! hay_terminal; then
+                falta "la llave de despliegue: GitHub todavía no la acepta. Pégala como se indica arriba y vuelve a correr el mismo comando (la llave ya existe, no se rehace)."
+                printf '\n'
+                return 2
+            fi
+            esperar_enter 'Cuando la hayas guardado en GitHub, pulsa Enter…'
+            if el_remoto_responde; then
+                break
+            fi
+            if ((intento >= 3)) || ! preguntar 'GitHub aún no responde con esa llave. ¿Reintento?' s; then
+                falta 'la llave de despliegue: git ls-remote no responde por SSH. Revisa que la pegaste entera en Deploy keys de pgq27/Lion y vuelve a correr el mismo comando.'
+                return 2
+            fi
+        done
+        hecho "GitHub responde por SSH con la llave de despliegue"
+    fi
 
     paso 3 "Clonar Lion en $private"
     mkdir -p "$private"
-    if [[ -d "$private/.git" && -f "$private/artisan" ]]; then
-        ya_estaba "Lion ya está clonado en $private (sigo con el instalador)"
-    else
-        if [[ -n "$(ls -A "$private")" ]]; then
-            anterior="$casa/web/$dominio/private.anterior"
-            aviso "$private no está vacía: hay una instalación o archivos anteriores."
-            find "$private" -mindepth 1 -maxdepth 1 -printf '%f
-' | head -n 8 | sed 's/^/      /' || true
-            if [[ -e "$anterior" ]]; then
-                morir "Ya existe $anterior: muévela o bórrala tú y vuelve a correr el arranque."
-            fi
-            if ! preguntar "¿Muevo su contenido a $anterior para clonar limpio?"; then
-                morir "git clone exige la carpeta vacía. Mueve el contenido de $private a otro lado (o confirma el traslado con una terminal) y vuelve a correr el arranque."
-            fi
-            mkdir "$anterior"
-            find "$private" -mindepth 1 -maxdepth 1 -exec mv -t "$anterior" {} +
-            hecho "lo anterior quedó en $anterior (su .env y su storage siguen ahí por si los necesitas)"
+    hay_que_clonar=1
+    if [[ -d "$private/.git" && -f "$private/artisan" && ! -f "$private/.env" ]]; then
+        # un arranque anterior que se cortó después del clon y antes de crear el .env
+        ya_estaba "Lion ya está clonado en $private, todavía sin .env (sigo con el instalador)"
+        hay_que_clonar=0
+    elif [[ -n "$(ls -A "$private")" ]]; then
+        if limpiar_private "$dominio" "$private"; then
+            hay_que_clonar=1
+        elif [[ -d "$private/.git" && -f "$private/artisan" ]]; then
+            ya_estaba "sigo con la instalación que hay en $private (instalar.sh es repetible)"
+            hay_que_clonar=0
+        else
+            morir "git clone exige la carpeta vacía y no confirmaste borrarla. Vacía $private (o confirma desde una terminal) y vuelve a correr el arranque."
         fi
+    fi
+    if [[ $hay_que_clonar -eq 1 ]]; then
         haciendo 'git clone (rama main)'
         clon_ok=0
         if (cd "$private" && GIT_TERMINAL_PROMPT=0 git clone --quiet --branch main "$REPO_PRIVADO" .); then
@@ -506,6 +576,34 @@ parte_del_usuario() {
             morir "No pude clonar $REPO_PRIVADO en $private."
         fi
         hecho "Lion clonado en $private"
+    fi
+
+    # public_html tiene que ser un enlace a private/public: así el .env, storage y .git quedan
+    # FUERA de lo que el servidor publica. El enlace lo crea instalar.sh; acá solo se limpia, con
+    # confirmación, lo que haya de un sistema anterior.
+    publica="$casa/web/$dominio/public_html"
+    if [[ -L "$publica" ]]; then
+        destino="$(readlink "$publica")"
+        if [[ "$destino" == private/public || "$destino" == "$private/public" ]]; then
+            ya_estaba "public_html → $destino"
+        else
+            aviso "public_html es un enlace a $destino, no a private/public."
+            if preguntar "¿Quito ese enlace (no borra nada de $destino) para enlazarla a private/public?"; then
+                rm "$publica"
+                hecho "enlace quitado (apuntaba a $destino)"
+            else
+                aviso 'lo dejo: instalar.sh te lo marcará como pendiente.'
+            fi
+        fi
+    elif [[ -d "$publica" && -n "$(find "$publica" -mindepth 1 ! -type d ! -path "$publica/index.html" ! -path "$publica/robots.txt" -print -quit)" ]]; then
+        aviso "public_html tiene archivos que no son la bienvenida de Hestia (¿de otro sistema?):"
+        find "$publica" -mindepth 1 -maxdepth 1 -printf '%f\n' | head -n 8 | sed 's/^/      /' || true
+        if preguntar "¿BORRO todo $publica y la enlazo a private/public? (sin copia)"; then
+            rm -rf "$publica"
+            hecho "$publica borrada: instalar.sh la enlaza a private/public"
+        else
+            aviso 'los dejo: instalar.sh te lo marcará como pendiente.'
+        fi
     fi
 
     paso 4 'El instalador de Lion (instalar.sh)'

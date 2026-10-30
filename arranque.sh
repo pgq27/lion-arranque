@@ -50,7 +50,18 @@ TEXTO
 
 # ── Cómo habla el script ─────────────────────────────────────────────────────
 
-paso() { printf '\n[%s] %s\n' "$1" "$2"; }
+TOTAL_DE_PASOS=4
+
+# «[3/4 ▰▰▰▱] título  (1:42)»: en qué paso va y cuánto lleva desde que arrancó.
+paso() {
+    local barra='' i segundos
+    PASO_ACTUAL="$2"
+    segundos=$(($(date +%s) - INICIO))
+    for ((i = 1; i <= TOTAL_DE_PASOS; i++)); do
+        if ((i <= $1)); then barra+='▰'; else barra+='▱'; fi
+    done
+    printf '\n[%s/%s %s] %s  (%d:%02d)\n' "$1" "$TOTAL_DE_PASOS" "$barra" "$2" $((segundos / 60)) $((segundos % 60))
+}
 ya_estaba() { printf '  ✔ ya estaba: %s\n' "$1"; }
 haciendo() { printf '  → %s\n' "$1"; }
 hecho() { printf '  ✔ %s\n' "$1"; }
@@ -61,13 +72,51 @@ falta() {
 }
 morir() {
     printf '\n✖ %s\n' "$1" >&2
+    SALIDA_ESPERADA=1
     exit 1
+}
+
+# con_latido «mensaje» comando…: para lo largo que no dice nada. Mientras corre, cada 10 s imprime
+# cuánto lleva («sigue trabajando»), así se ve que no se colgó. Guarda la salida y, si el comando
+# falla, muestra sus últimas líneas. Devuelve el código del comando.
+con_latido() {
+    local mensaje="$1" salida reloj estado=0 inicio
+    shift
+    inicio="$(date +%s)"
+    salida="$(mktemp)"
+    haciendo "$mensaje"
+    (while sleep 10; do printf '      … sigue trabajando (%ss)\n' $(($(date +%s) - inicio)); done) &
+    reloj=$!
+    "$@" >"$salida" 2>&1 || estado=$?
+    kill "$reloj" 2>/dev/null || true
+    wait "$reloj" 2>/dev/null || true
+    if [[ $estado -ne 0 ]]; then
+        printf '  ✖ %s falló (código %s). Últimas líneas:\n' "$mensaje" "$estado"
+        tail -n 15 "$salida" | sed 's/^/      /' || true
+    fi
+    rm -f "$salida"
+    return "$estado"
 }
 
 PENDIENTES=()
 CON_TERMINAL=0
+INICIO="$(date +%s)"
+PASO_ACTUAL='arranque'
+SALIDA_ESPERADA=0
 TEMPORAL="$(mktemp -d)"
-trap 'rm -rf "$TEMPORAL"' EXIT
+
+# Al salir: limpia lo temporal y, si el arranque se cortó SIN decir por qué (una orden falló con
+# `set -e`), dice en qué paso fue y cuál orden.
+al_salir() {
+    local codigo="$1" comando="$2"
+    if [[ -n "${TEMPORAL:-}" ]]; then
+        rm -rf "$TEMPORAL"
+    fi
+    if [[ "$codigo" -ne 0 && "${SALIDA_ESPERADA:-0}" -ne 1 ]]; then
+        printf '\n✖ El arranque se cortó en el paso «%s» (código %s) con esta orden:\n      %s\n' "${PASO_ACTUAL:-inicio}" "$codigo" "$comando" >&2
+    fi
+}
+trap 'al_salir "$?" "$BASH_COMMAND"' EXIT
 
 # Con `curl | bash` la entrada estándar es el propio script: lo que se le pregunta al
 # dueño se lee de la terminal (/dev/tty). Sin terminal no se pregunta nada.
@@ -125,6 +174,7 @@ leer_argumentos() {
     done
     if [[ $# -lt 1 || "$1" == -* ]]; then
         ayuda >&2
+        SALIDA_ESPERADA=1
         exit 1
     fi
     DOMINIO="$1"
@@ -253,15 +303,18 @@ instalar_composer() {
     fi
 }
 
+bajar_e_instalar_node() {
+    curl -fsSL https://deb.nodesource.com/setup_22.x -o "$TEMPORAL/nodesource.sh" &&
+        como_admin bash "$TEMPORAL/nodesource.sh" &&
+        como_admin env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+}
+
 instalar_node() {
     if ! command -v apt-get >/dev/null 2>&1; then
         falta 'Node 22 LTS: este servidor no usa apt; instálalo con el método de tu distribución (https://nodejs.org).'
         return
     fi
-    haciendo 'agregando el repositorio de NodeSource (Node 22 LTS) e instalando nodejs'
-    if curl -fsSL https://deb.nodesource.com/setup_22.x -o "$TEMPORAL/nodesource.sh" &&
-        como_admin bash "$TEMPORAL/nodesource.sh" >/dev/null &&
-        como_admin env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs >/dev/null; then
+    if con_latido 'agregando el repositorio de NodeSource (Node 22 LTS) e instalando nodejs' bajar_e_instalar_node; then
         hecho "Node $(node -v) y npm $(npm -v)"
     else
         falta 'Node 22 LTS: la instalación falló (curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs).'
@@ -273,8 +326,7 @@ instalar_cliente_mariadb() {
         falta 'el cliente de MariaDB (mariadb-dump o mysqldump): instala el paquete del cliente de tu distribución.'
         return
     fi
-    haciendo 'instalando mariadb-client'
-    if como_admin env DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-client >/dev/null; then
+    if con_latido 'instalando mariadb-client' como_admin env DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-client; then
         hecho 'cliente de MariaDB instalado'
     else
         falta 'el cliente de MariaDB: sudo apt-get install -y mariadb-client'
@@ -389,8 +441,8 @@ preparar_servidor() {
 # en un bash NUEVO con -e activo (dentro de un `|| …` bash apagaría -e en la función).
 codigo_del_usuario() {
     # shellcheck disable=SC2016  # $HOME se expande en el shell del hijo, no acá
-    printf 'set -euo pipefail; cd "$HOME"; %s\n%s\nparte_del_usuario %s' \
-        "$(declare -p REPO_PRIVADO URL_GITHUB_LLAVES LLAVE CON_TERMINAL)" "$(declare -f)" "$(printf '%q ' "$@")"
+    printf 'set -euo pipefail; cd "$HOME"; %s\n%s\ntrap '"'"'al_salir "$?" "$BASH_COMMAND"'"'"' EXIT\nparte_del_usuario %s' \
+        "$(declare -p REPO_PRIVADO URL_GITHUB_LLAVES LLAVE CON_TERMINAL INICIO TOTAL_DE_PASOS)" "$(declare -f)" "$(printf '%q ' "$@")"
 }
 
 # Entra como el usuario del sitio. SOLO se llama desde la rama con root o sudo; el resto
@@ -607,6 +659,10 @@ limpiar_private() {
     hecho "$private quedó vacía"
 }
 
+clonar_lion() {
+    (cd "$1" && GIT_TERMINAL_PROMPT=0 git clone --quiet --branch main "$REPO_PRIVADO" .)
+}
+
 # Todo lo que sigue corre con la identidad del usuario del sitio. No se llama por nombre acá:
 # `codigo_del_usuario` lo manda dentro del bash nuevo.
 # Argumentos: DOMINIO USUARIO [opciones de instalar.sh…]
@@ -694,6 +750,7 @@ parte_del_usuario() {
             if ! hay_terminal; then
                 falta "la llave de despliegue: GitHub todavía no la acepta. Pégala como se indica arriba y vuelve a correr el mismo comando (la llave ya existe, no se rehace)."
                 printf '\n'
+                SALIDA_ESPERADA=1
                 return 2
             fi
             esperar_enter 'Cuando la hayas guardado en GitHub, pulsa Enter…'
@@ -702,6 +759,7 @@ parte_del_usuario() {
             fi
             if ((intento >= 3)) || ! preguntar 'GitHub aún no responde con esa llave. ¿Reintento?' s; then
                 falta 'la llave de despliegue: git ls-remote no responde por SSH. Revisa que la pegaste entera en Deploy keys de pgq27/Lion y vuelve a correr el mismo comando.'
+                SALIDA_ESPERADA=1
                 return 2
             fi
         done
@@ -726,9 +784,8 @@ parte_del_usuario() {
         fi
     fi
     if [[ $hay_que_clonar -eq 1 ]]; then
-        haciendo 'git clone (rama main)'
         clon_ok=0
-        if (cd "$private" && GIT_TERMINAL_PROMPT=0 git clone --quiet --branch main "$REPO_PRIVADO" .); then
+        if con_latido 'git clone (rama main)' clonar_lion "$private"; then
             clon_ok=1
         fi
         if [[ $clon_ok -ne 1 || ! -f "$private/instalar.sh" ]]; then
@@ -810,6 +867,7 @@ parte_del_usuario() {
         LION_DB_CLAVE="${REUSO_CLAVE:-${LION_DB_CLAVE:-}}" bash instalar.sh "$@" </dev/null || codigo=$?
     fi
     REUSO_CLAVE=''
+    SALIDA_ESPERADA=1
     return "$codigo"
 }
 
@@ -858,6 +916,7 @@ main() {
             codigo=2
         fi
     fi
+    SALIDA_ESPERADA=1
     exit "$codigo"
 }
 

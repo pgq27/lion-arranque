@@ -396,13 +396,20 @@ codigo_del_usuario() {
 # del arranque no usa `su`. Con --session-command (y no con -c) `su` NO abre una sesión nueva:
 # con -c el hijo pierde la terminal de control, /dev/tty deja de existir y ninguna pregunta
 # (borrar, vaciar la base, las del instalador) llegaría a hacerse.
+# La entrada se fija a mano: con `curl | bash` la estándar es la tubería del script, y `sudo`
+# (que corre el comando en su propio pty) solo reenvía el teclado al hijo si la entrada estándar
+# es una terminal; si no, toda lectura de /dev/tty queda esperando para siempre.
 correr_como_el_usuario_del_sitio() {
-    local codigo
+    local codigo entrada=/dev/null
     codigo="$(codigo_del_usuario "$@")"
+    if [[ "$CON_TERMINAL" -eq 1 ]]; then
+        entrada=/dev/tty
+    fi
     if [[ $ES_ROOT -eq 1 ]]; then
-        su - "$USUARIO" -s /bin/bash --session-command "$codigo"
+        su - "$USUARIO" -s /bin/bash --session-command "$codigo" <"$entrada"
     else
-        sudo su - "$USUARIO" -s /bin/bash --session-command "$codigo"
+        # shellcheck disable=SC2024  # la terminal la abre quien lanza el arranque, a propósito
+        sudo su - "$USUARIO" -s /bin/bash --session-command "$codigo" <"$entrada"
     fi
 }
 

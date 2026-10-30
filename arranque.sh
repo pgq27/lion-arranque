@@ -430,10 +430,110 @@ valor_del_env() {
     printf '%s' "${linea#\"}"
 }
 
+# Un valor del .env viejo leído como lo lee Laravel (comillas, escapes, #). Con el vendor de esa
+# instalación; sin él, una lectura simple sin las comillas de los extremos. Solo para la base.
+# shellcheck disable=SC2016
+valor_exacto_del_env() {
+    local php_bin="$1" private="$2" clave="$3" valor=''
+    if [[ -f "$private/vendor/autoload.php" ]]; then
+        valor="$(cd "$private" && "$php_bin" -r 'require "vendor/autoload.php"; $v = Dotenv\Dotenv::parse((string) file_get_contents(".env")); echo $v[$argv[1]] ?? "";' -- "$clave" 2>/dev/null)" || valor=''
+    fi
+    if [[ -z "$valor" ]]; then
+        valor="$(valor_del_env "$private" "$clave")"
+    fi
+    printf '%s' "$valor"
+}
+
+# Qué se lleva del .env viejo a la instalación nueva. Muestra los grupos por NOMBRE (jamás un valor
+# secreto) y deja elegir cada uno. Lo elegido se arma en memoria (ENV_A_CONSERVAR) y, tras el clon,
+# se escribe como el .env del que parte `instalar.sh --reconfigurar`: éste conserva todo lo agregado a
+# mano y rehace solo lo fijo de producción. Los datos de la base van aparte (REUSO_*): la clave viaja
+# por LION_DB_CLAVE, nunca por opción. Redis no se decide acá: lion:configurar-env lo detecta y pregunta.
+# Argumentos: private php_bin conecta(0|1) vaciar(0|1) base usuario_base
+elegir_que_conservar() {
+    local private="$1" php_bin="$2" conecta="$3" vaciar="$4" base="$5" usuario_base="$6"
+    local viejo="$private/.env" kb=0 kc=0 kp=0 ko=0 prueba_base prueba_usuario otros cuantos nombres defecto_cifrado=s
+    [[ -f "$viejo" ]] || return 0
+    printf '\n  El .env anterior trae estas cosas; elige qué se lleva a la instalación nueva.\n'
+    printf '  (Redis lo decide el instalador: detecta si el servidor lo tiene y te pregunta.)\n'
+
+    if [[ "$conecta" -eq 1 ]]; then
+        if preguntar "Base principal «$base» (usuario «$usuario_base»): ¿la conservo, sin volver a escribir la clave? (la clave queda solo en memoria)" s; then
+            kb=1
+            REUSO_BASE="$base"
+            REUSO_USUARIO="$usuario_base"
+            REUSO_CLAVE="$(valor_exacto_del_env "$php_bin" "$private" DB_PASSWORD)"
+        fi
+    elif [[ -n "$base" ]]; then
+        aviso "la base principal «$base» no conectó con el .env viejo (o está en otro servidor): el instalador te pedirá los datos."
+    fi
+
+    if [[ -n "$(valor_del_env "$private" APP_KEY)" ]]; then
+        if [[ "$vaciar" -eq 1 ]]; then
+            defecto_cifrado=n
+            printf '  Vas a vaciar la base: no queda nada cifrado que dependa de la APP_KEY vieja.\n'
+        else
+            printf '  Sin la APP_KEY vieja, lo cifrado en la base (certificado, clave SOL, tokens) queda ilegible.\n'
+        fi
+        if preguntar 'Claves de cifrado (APP_KEY y la frase del respaldo): ¿las conservo?' "$defecto_cifrado"; then
+            kc=1
+        fi
+    fi
+
+    prueba_base="$(valor_del_env "$private" RESPALDO_PRUEBA_DB_DATABASE)"
+    if [[ -n "$prueba_base" ]]; then
+        prueba_usuario="$(valor_del_env "$private" RESPALDO_PRUEBA_DB_USERNAME)"
+        if preguntar "Base de prueba de restauración «$prueba_base» (usuario «${prueba_usuario:-?}»): ¿la conservo?" s; then
+            kp=1
+        fi
+    fi
+
+    # Lo que es TUYO: claves con valor que difieren del .env.example de esa instalación (correo,
+    # integraciones, rutas de composer y del respaldo…). Los valores de plantilla y las claves que el
+    # instalador rehace por su cuenta no cuentan.
+    ejemplo="$private/.env.example"
+    [[ -f "$ejemplo" ]] || ejemplo=/dev/null
+    otros="$(awk -v q="'" '
+        function llave(l,   k) { k = l; sub(/=.*/, "", k); gsub(/[[:space:]]/, "", k); return k }
+        function valor(l) { return substr(l, index(l, "=") + 1) }
+        FILENAME == ARGV[1] { if ($0 ~ /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=/) ej[llave($0)] = valor($0); next }
+        /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=/ { k = llave($0); v = valor($0); if (v != "" && v != "\"\"" && v != q q && !((k in ej) && ej[k] == v)) print k }
+        ' "$ejemplo" "$viejo" |
+        grep -vE '^(APP_KEY|BACKUP_ARCHIVE_PASSWORD|DB_|RESPALDO_PRUEBA_DB_|APP_ENV|APP_DEBUG|APP_URL|APP_NAME|APP_TIMEZONE|SESSION_|EXIGIR_HTTPS|CSP_|LOG_|QUEUE_CONNECTION|CACHE_STORE|REDIS_|ACTUALIZADOR_PHP_BIN)' || true)"
+    cuantos="$(printf '%s' "$otros" | grep -c . || true)"
+    if [[ "$cuantos" -gt 0 ]]; then
+        nombres="$(printf '%s\n' "$otros" | head -n 8 | paste -sd, - | sed 's/,/, /g')"
+        if preguntar "Otros ajustes y credenciales que agregaste ($cuantos claves, p. ej. $nombres): ¿los conservo?" s; then
+            ko=1
+            REUSO_CORREO="$(valor_del_env "$private" MAIL_FROM_ADDRESS)"
+            # un correo de plantilla (hello@example.com) no es una respuesta: que el instalador lo pregunte
+            if [[ "$REUSO_CORREO" =~ @example\.(com|org|net)$ ]]; then
+                REUSO_CORREO=''
+            fi
+            REUSO_ZONA="$(valor_del_env "$private" APP_TIMEZONE)"
+        fi
+    fi
+
+    # kb/kc/kp/ko son los grupos que se quedan; ko también lleva comentarios y líneas sueltas.
+    ENV_A_CONSERVAR="$(awk -v kb="$kb" -v kc="$kc" -v kp="$kp" -v ko="$ko" '
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { if (ko == 1) print; next }
+        {
+            k = $0; sub(/=.*/, "", k); gsub(/[[:space:]]/, "", k)
+            if (k ~ /^DB_(DATABASE|USERNAME|PASSWORD)$/) g = kb
+            else if (k == "APP_KEY" || k == "BACKUP_ARCHIVE_PASSWORD") g = kc
+            else if (k ~ /^RESPALDO_PRUEBA_DB_/) g = kp
+            else g = ko
+            if (g == 1) print
+        }' "$viejo")"
+    if [[ -n "$ENV_A_CONSERVAR" ]]; then
+        hecho "me llevo del .env viejo lo que elegiste (en memoria; se escribe con permisos 600 en la instalación nueva)"
+    fi
+}
+
 # Borra lo que haya en private/ para instalar de cero. No hay copia ni vuelta atrás, por eso se
 # pide escribir el dominio. Devuelve 0 si limpió y 1 si el dueño no lo confirmó.
 limpiar_private() {
-    local dominio="$1" private="$2" respuesta='' base usuario_base php_bin vaciar=0
+    local dominio="$1" private="$2" respuesta='' base usuario_base php_bin vaciar=0 conecta con_app
     if [[ -z "$dominio" || -L "$private" || ! -d "$private" || "$private" != /home/*/web/"$dominio"/private ]]; then
         morir "No borro $private: no es la carpeta private/ de un sitio de Hestia."
     fi
@@ -451,14 +551,26 @@ limpiar_private() {
     fi
     base="$(valor_del_env "$private" DB_DATABASE)"
     usuario_base="$(valor_del_env "$private" DB_USERNAME)"
-    if [[ -n "$base" && -f "$private/artisan" && -f "$private/vendor/autoload.php" ]]; then
-        aviso "La instalación actual usa la base «$base» (usuario «$usuario_base»): anota esos datos, el instalador te los va a pedir junto con la clave."
-        if preguntar "¿Vacío también la base «$base» (borra TODAS sus tablas) para que la instalación sea de cero?"; then
+    php_bin="$(php_del_sitio "$dominio")"
+    # Se prueba que la clave vieja conecte ANTES de borrar nada: si no conecta, no se ofrece reusarla.
+    conecta=0
+    con_app=0
+    if [[ -f "$private/artisan" && -f "$private/vendor/autoload.php" ]]; then
+        con_app=1
+    fi
+    if [[ -n "$base" && -n "$usuario_base" && $con_app -eq 1 ]] &&
+        [[ "$(valor_del_env "$private" DB_HOST)" =~ ^(|127\.0\.0\.1|localhost)$ ]] &&
+        (cd "$private" && "$php_bin" artisan db:show --json >/dev/null 2>&1); then
+        conecta=1
+    fi
+    # Primero se decide si se vacía la base: de eso depende lo que conviene conservar del .env.
+    if [[ -n "$base" && $con_app -eq 1 ]]; then
+        if preguntar "¿Vacío la base «$base» (borra TODAS sus tablas) para que la instalación sea de cero?"; then
             vaciar=1
         fi
     fi
+    elegir_que_conservar "$private" "$php_bin" "$conecta" "$vaciar" "$base" "$usuario_base"
     if [[ $vaciar -eq 1 ]]; then
-        php_bin="$(php_del_sitio "$dominio")"
         haciendo "vaciando la base «$base» con $php_bin artisan db:wipe"
         if ! (cd "$private" && "$php_bin" artisan db:wipe --force); then
             morir "No pude vaciar la base «$base»: no borré nada de $private. Vacíala a mano (Hestia → Base de datos) y vuelve a correr el arranque."
@@ -483,6 +595,12 @@ parte_del_usuario() {
     casa="$HOME"
     private="$casa/web/$dominio/private"
     PENDIENTES=()
+    REUSO_BASE=''
+    REUSO_USUARIO=''
+    REUSO_CLAVE=''
+    REUSO_CORREO=''
+    REUSO_ZONA=''
+    ENV_A_CONSERVAR=''
 
     # Si el que lanzó el arranque tenía terminal y esta parte no la heredó, seguir sin preguntar
     # dejaría pasar de largo todo lo que pide confirmación: mejor cortar.
@@ -587,6 +705,25 @@ parte_del_usuario() {
         hecho "Lion clonado en $private"
     fi
 
+    # Lo que el dueño eligió llevarse del .env viejo: se escribe (solo el dueño lo puede leer) y
+    # instalar.sh --reconfigurar parte de él, conserva lo agregado a mano y rehace lo fijo.
+    if [[ -n "$ENV_A_CONSERVAR" && $hay_que_clonar -eq 1 ]]; then
+        (umask 077 && printf '%s\n' "$ENV_A_CONSERVAR" >"$private/.env")
+        chmod 600 "$private/.env"
+        ENV_A_CONSERVAR=''
+        set -- --reconfigurar "$@"
+        if [[ -n "$REUSO_BASE" ]]; then
+            set -- --si "$@"
+        fi
+        if [[ -n "$REUSO_CORREO" ]]; then
+            set -- "--correo=$REUSO_CORREO" "$@"
+        fi
+        if [[ -n "$REUSO_ZONA" ]]; then
+            set -- "--zona=$REUSO_ZONA" "$@"
+        fi
+        hecho "$private/.env escrito con lo que elegiste conservar (permisos 600)"
+    fi
+
     # public_html tiene que ser un enlace a private/public: así el .env, storage y .git quedan
     # FUERA de lo que el servidor publica. El enlace lo crea instalar.sh; acá solo se limpia, con
     # confirmación, lo que haya de un sistema anterior.
@@ -625,13 +762,18 @@ parte_del_usuario() {
     if [[ $dominio_dado -eq 0 ]]; then
         set -- "--dominio=$dominio" "$@"
     fi
+    if [[ -n "$REUSO_BASE" ]]; then
+        set -- "--base=$REUSO_BASE" "--usuario=$REUSO_USUARIO" "$@"
+    fi
     cd "$private"
     codigo=0
+    # La clave de la base viaja en el entorno SOLO de este proceso (LION_DB_CLAVE), nunca como opción.
     if hay_terminal; then
-        bash instalar.sh "$@" </dev/tty || codigo=$?
+        LION_DB_CLAVE="${REUSO_CLAVE:-${LION_DB_CLAVE:-}}" bash instalar.sh "$@" </dev/tty || codigo=$?
     else
-        bash instalar.sh "$@" </dev/null || codigo=$?
+        LION_DB_CLAVE="${REUSO_CLAVE:-${LION_DB_CLAVE:-}}" bash instalar.sh "$@" </dev/null || codigo=$?
     fi
+    REUSO_CLAVE=''
     return "$codigo"
 }
 

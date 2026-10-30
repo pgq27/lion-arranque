@@ -45,9 +45,15 @@ frase), el bloque de `~/.ssh/config`, el clon en
    Deploy keys → Add deploy key, **sin** marcar *Allow write access*, y pulsar Enter.
 3. Si el dominio ya tenía algo (una instalación de Lion o de otro sistema), el
    arranque instala **de cero**: antes de borrar `private/` te pide **escribir el
-   dominio**; si el `.env` anterior indica una base, te pregunta si la vacía
-   (`php artisan db:wipe`) y te dice su nombre y usuario para que los anotes (el
-   instalador te los vuelve a pedir, con la clave). No guarda copias: lo borrado
+   dominio** y, si hay un `.env` anterior, te deja **elegir qué te llevas** (solo
+   nombres en pantalla, nunca valores secretos): la base principal si conecta (la
+   clave viaja a `instalar.sh` por `LION_DB_CLAVE` y no la vuelves a escribir), las
+   claves de cifrado (`APP_KEY` y la frase del respaldo; por defecto sí, salvo que
+   vacíes la base), la base de prueba de restauración (`RESPALDO_PRUEBA_DB_*`) y
+   los demás ajustes que agregaste (correo, integraciones, rutas de composer…).
+   Lo que elijas se escribe, solo para el dueño, como el `.env` del que parte
+   `instalar.sh --reconfigurar`. Redis lo decide el instalador (detecta y
+   pregunta). También te pregunta si vacía la base (`php artisan db:wipe`). No guarda copias: lo borrado
    no vuelve. Si en `public_html` hay archivos de otro sistema, también pide
    confirmar antes de borrarla; si es un enlace a otro lado, solo quita el enlace.
    Después `instalar.sh` la enlaza a `private/public`, para que `.env`, `storage` y

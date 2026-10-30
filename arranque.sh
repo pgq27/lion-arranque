@@ -408,8 +408,10 @@ correr_como_el_usuario_del_sitio() {
     if [[ $ES_ROOT -eq 1 ]]; then
         su - "$USUARIO" -s /bin/bash --session-command "$codigo" <"$entrada"
     else
+        # Sin `su` de por medio: con sudo directo el hijo queda en el grupo de procesos que recibe el
+        # teclado de la terminal; con `sudo su -` la lectura de /dev/tty recibía SIGTTIN y moría.
         # shellcheck disable=SC2024  # la terminal la abre quien lanza el arranque, a propósito
-        sudo su - "$USUARIO" -s /bin/bash --session-command "$codigo" <"$entrada"
+        sudo -u "$USUARIO" -H -- /bin/bash -c "$codigo" <"$entrada"
     fi
 }
 
@@ -597,7 +599,7 @@ limpiar_private() {
 parte_del_usuario() {
     local dominio="$1" usuario="$2"
     shift 2
-    local casa private publica config llave_publica limite=() intento clon_ok hay_que_clonar destino codigo
+    local casa private publica config llave_publica intento clon_ok hay_que_clonar destino codigo
 
     casa="$HOME"
     private="$casa/web/$dominio/private"
@@ -623,12 +625,12 @@ parte_del_usuario() {
     done
     mkdir -p "$casa/.ssh"
     chmod 700 "$casa/.ssh"
-    if command -v timeout >/dev/null 2>&1; then
-        limite=(timeout 30)
-    fi
+    # Sin `timeout`: pone a git en un grupo de procesos de segundo plano y, tras eso, la lectura de
+    # /dev/tty de las preguntas siguientes recibía SIGTTIN y el arranque moría con «Killed». El tope
+    # de espera lo ponen las opciones de ssh.
     el_remoto_responde() {
-        GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=15' \
-            ${limite[@]+"${limite[@]}"} git ls-remote --heads "$REPO_PRIVADO" main >/dev/null 2>&1 </dev/null
+        GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=5 -o ServerAliveCountMax=3' \
+            git ls-remote --heads "$REPO_PRIVADO" main >/dev/null 2>&1 </dev/null
     }
 
     # Si este usuario YA llega al repositorio privado (una llave de despliegue de antes, por

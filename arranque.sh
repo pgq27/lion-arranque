@@ -565,8 +565,12 @@ limpiar_private() {
     # Se prueba que la clave vieja conecte ANTES de borrar nada: si no conecta, no se ofrece reusarla.
     conecta=0
     con_app=0
-    if [[ -f "$private/artisan" && -f "$private/vendor/autoload.php" ]]; then
+    # Solo se toca la base de una instalación de LION (trae instalar.sh): en una carpeta de otro
+    # sistema el .env es de otro y su base no es de este arranque, aunque la carpeta se borre.
+    if [[ -f "$private/artisan" && -f "$private/vendor/autoload.php" && -f "$private/instalar.sh" ]]; then
         con_app=1
+    elif [[ -f "$private/artisan" ]]; then
+        aviso 'esa carpeta no parece de Lion (sin instalar.sh): no toco su base de datos ni reuso su .env.'
     fi
     if [[ -n "$base" && -n "$usuario_base" && $con_app -eq 1 ]] &&
         [[ "$(valor_del_env "$private" DB_HOST)" =~ ^(|127\.0\.0\.1|localhost)$ ]] &&
@@ -575,7 +579,7 @@ limpiar_private() {
     fi
     # Primero se decide si se vacía la base: de eso depende lo que conviene conservar del .env.
     if [[ -n "$base" && $con_app -eq 1 ]]; then
-        if preguntar "¿Vacío la base «$base» (borra TODAS sus tablas) para que la instalación sea de cero?"; then
+        if preguntar "¿Vacío la base «$base» en «$(valor_del_env "$private" DB_HOST)» (borra TODAS sus tablas) para que la instalación sea de cero?"; then
             vaciar=1
         fi
     fi
@@ -607,6 +611,11 @@ parte_del_usuario() {
     local casa private publica config llave_publica intento clon_ok hay_que_clonar destino codigo
 
     casa="$HOME"
+    # Todo cuelga de la casa del usuario del sitio: si HOME no es esa (un sudo que lo conserve, un
+    # HOME vacío o «/»), las rutas de abajo caerían en otro lado del servidor.
+    if [[ "$casa" != "/home/$usuario" ]]; then
+        morir "HOME es «$casa» y esperaba /home/$usuario: no sigo, para no escribir fuera de la casa del sitio."
+    fi
     private="$casa/web/$dominio/private"
     PENDIENTES=()
     REUSO_BASE=''

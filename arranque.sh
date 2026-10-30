@@ -552,6 +552,7 @@ elegir_que_conservar() {
         prueba_usuario="$(valor_del_env "$private" RESPALDO_PRUEBA_DB_USERNAME)"
         if preguntar "Base de prueba de restauración «$prueba_base» (usuario «${prueba_usuario:-?}»): ¿la conservo?" s; then
             kp=1
+            REUSO_PRUEBA=1
         fi
     fi
 
@@ -684,6 +685,7 @@ parte_del_usuario() {
     REUSO_CLAVE=''
     REUSO_CORREO=''
     REUSO_ZONA=''
+    REUSO_PRUEBA=''
     ENV_A_CONSERVAR=''
 
     # Si el que lanzó el arranque tenía terminal y esta parte no la heredó, seguir sin preguntar
@@ -813,6 +815,10 @@ parte_del_usuario() {
         fi
         if [[ -n "$REUSO_ZONA" ]]; then
             set -- "--zona=$REUSO_ZONA" "$@"
+        fi
+        # la base de prueba que elegiste conservar ya viaja en ese .env: el instalador no la vuelve a preguntar
+        if [[ -n "$REUSO_PRUEBA" ]]; then
+            set -- --prueba=no "$@"
         fi
         hecho "$private/.env escrito con lo que elegiste conservar (permisos 600)"
     fi

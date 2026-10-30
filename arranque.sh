@@ -65,6 +65,7 @@ morir() {
 }
 
 PENDIENTES=()
+CON_TERMINAL=0
 TEMPORAL="$(mktemp -d)"
 trap 'rm -rf "$TEMPORAL"' EXIT
 
@@ -388,18 +389,20 @@ preparar_servidor() {
 # en un bash NUEVO con -e activo (dentro de un `|| …` bash apagaría -e en la función).
 codigo_del_usuario() {
     printf 'set -euo pipefail; %s\n%s\nparte_del_usuario %s' \
-        "$(declare -p REPO_PRIVADO URL_GITHUB_LLAVES LLAVE)" "$(declare -f)" "$(printf '%q ' "$@")"
+        "$(declare -p REPO_PRIVADO URL_GITHUB_LLAVES LLAVE CON_TERMINAL)" "$(declare -f)" "$(printf '%q ' "$@")"
 }
 
 # Entra como el usuario del sitio. SOLO se llama desde la rama con root o sudo; el resto
-# del arranque no usa `su`.
+# del arranque no usa `su`. Con --session-command (y no con -c) `su` NO abre una sesión nueva:
+# con -c el hijo pierde la terminal de control, /dev/tty deja de existir y ninguna pregunta
+# (borrar, vaciar la base, las del instalador) llegaría a hacerse.
 correr_como_el_usuario_del_sitio() {
     local codigo
     codigo="$(codigo_del_usuario "$@")"
     if [[ $ES_ROOT -eq 1 ]]; then
-        su - "$USUARIO" -s /bin/bash -c "$codigo"
+        su - "$USUARIO" -s /bin/bash --session-command "$codigo"
     else
-        sudo su - "$USUARIO" -s /bin/bash -c "$codigo"
+        sudo su - "$USUARIO" -s /bin/bash --session-command "$codigo"
     fi
 }
 
@@ -480,6 +483,12 @@ parte_del_usuario() {
     casa="$HOME"
     private="$casa/web/$dominio/private"
     PENDIENTES=()
+
+    # Si el que lanzó el arranque tenía terminal y esta parte no la heredó, seguir sin preguntar
+    # dejaría pasar de largo todo lo que pide confirmación: mejor cortar.
+    if [[ "$CON_TERMINAL" -eq 1 ]] && ! hay_terminal; then
+        morir 'Perdí la terminal al entrar como el usuario del sitio y no puedo hacerte las preguntas. Entra por SSH como ese usuario y vuelve a correr el mismo comando.'
+    fi
 
     paso 2 "La llave de despliegue de $usuario"
     for programa in git ssh ssh-keygen; do
@@ -632,6 +641,9 @@ main() {
     local codigo=0
 
     leer_argumentos "$@"
+    if hay_terminal; then
+        CON_TERMINAL=1
+    fi
 
     printf 'Arranque de Lion — %s\n' "$DOMINIO"
     printf '\nEste arranque NO toca Hestia: el dominio, la base de datos con su usuario y el SSL\n'

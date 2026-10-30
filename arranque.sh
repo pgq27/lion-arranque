@@ -388,7 +388,8 @@ preparar_servidor() {
 # El código que corre el usuario del sitio: todas las funciones de este script más la llamada,
 # en un bash NUEVO con -e activo (dentro de un `|| …` bash apagaría -e en la función).
 codigo_del_usuario() {
-    printf 'set -euo pipefail; %s\n%s\nparte_del_usuario %s' \
+    # shellcheck disable=SC2016  # $HOME se expande en el shell del hijo, no acá
+    printf 'set -euo pipefail; cd "$HOME"; %s\n%s\nparte_del_usuario %s' \
         "$(declare -p REPO_PRIVADO URL_GITHUB_LLAVES LLAVE CON_TERMINAL)" "$(declare -f)" "$(printf '%q ' "$@")"
 }
 
@@ -587,8 +588,12 @@ limpiar_private() {
         hecho "base «$base» vacía"
     fi
     haciendo "borrando el contenido de $private"
+    # carpetas sin permiso de escritura propias (vendor de solo lectura, etc.) no deben frenar el borrado
+    chmod -R u+rwX "$private" 2>/dev/null || true
     if ! find "$private" -mindepth 1 -delete; then
-        morir "No pude borrar todo el contenido de $private. Revisa los permisos y vuelve a correr el arranque."
+        printf '\n  Hay archivos que %s no puede borrar (de otro dueño o con otros permisos), por ejemplo:\n' "$(id -un)"
+        find "$private" ! -user "$(id -un)" -printf '      %u:%g  %p\n' 2>/dev/null | head -n 8 || true
+        morir "No pude borrar todo el contenido de $private. El administrador lo vacía con: sudo find $private -mindepth 1 -delete   (y después vuelve a correr el mismo comando del arranque)."
     fi
     hecho "$private quedó vacía"
 }

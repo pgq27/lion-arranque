@@ -408,11 +408,16 @@ correr_como_el_usuario_del_sitio() {
     fi
     if [[ $ES_ROOT -eq 1 ]]; then
         su - "$USUARIO" -s /bin/bash --session-command "$codigo" <"$entrada"
+    elif [[ "$CON_TERMINAL" -eq 1 ]]; then
+        # Dentro de `curl | bash` este proceso no es interactivo y comparte grupo de procesos con la
+        # tubería: `sudo` (sea con `su` o directo) deja entonces a su hijo en SEGUNDO PLANO de su
+        # terminal y toda lectura de teclado queda muda (o recibe SIGTTIN y muere con «Killed»).
+        # Un bash interactivo le da a `sudo` su propio grupo de procesos y la terminal, como cuando
+        # se lo escribe a mano. Medido en el servidor: PGID = TPGID solo así.
+        # shellcheck disable=SC2016  # $1, $2 y $? son del bash de adentro, no de acá
+        bash --norc --noprofile -i -c 'unset HISTFILE; sudo -u "$1" -H -- /bin/bash -c "$2" </dev/tty; exit $?' _ "$USUARIO" "$codigo"
     else
-        # Sin `su` de por medio: con sudo directo el hijo queda en el grupo de procesos que recibe el
-        # teclado de la terminal; con `sudo su -` la lectura de /dev/tty recibía SIGTTIN y moría.
-        # shellcheck disable=SC2024  # la terminal la abre quien lanza el arranque, a propósito
-        sudo -u "$USUARIO" -H -- /bin/bash -c "$codigo" <"$entrada"
+        sudo -u "$USUARIO" -H -- /bin/bash -c "$codigo" </dev/null
     fi
 }
 
@@ -608,7 +613,7 @@ limpiar_private() {
 parte_del_usuario() {
     local dominio="$1" usuario="$2"
     shift 2
-    local casa private publica config llave_publica intento clon_ok hay_que_clonar destino codigo
+    local casa private publica config llave_publica intento clon_ok hay_que_clonar destino codigo mi_grupo grupo_de_la_terminal
 
     casa="$HOME"
     # Todo cuelga de la casa del usuario del sitio: si HOME no es esa (un sudo que lo conserve, un
@@ -629,6 +634,14 @@ parte_del_usuario() {
     # dejaría pasar de largo todo lo que pide confirmación: mejor cortar.
     if [[ "$CON_TERMINAL" -eq 1 ]] && ! hay_terminal; then
         morir 'Perdí la terminal al entrar como el usuario del sitio y no puedo hacerte las preguntas. Entra por SSH como ese usuario y vuelve a correr el mismo comando.'
+    fi
+    # Con terminal pero en SEGUNDO PLANO de ella (grupo de procesos ≠ grupo de la terminal) las
+    # preguntas se pintan y nunca leen lo que escribes: mejor cortar con el motivo que colgarse mudo.
+    if [[ "$CON_TERMINAL" -eq 1 ]] && command -v ps >/dev/null 2>&1; then
+        read -r mi_grupo grupo_de_la_terminal < <(ps -o pgid=,tpgid= -p $$ 2>/dev/null || true) || true
+        if [[ -n "${mi_grupo:-}" && "${grupo_de_la_terminal:-}" =~ ^[0-9]+$ && "$mi_grupo" != "$grupo_de_la_terminal" ]]; then
+            morir "La terminal no me entrega el teclado (grupo de procesos $mi_grupo, el de la terminal es $grupo_de_la_terminal): las preguntas se quedarían mudas. Entra como el usuario del sitio (por ejemplo: sudo -iu $usuario) y vuelve a correr el mismo comando."
+        fi
     fi
 
     paso 2 "La llave de despliegue de $usuario"
